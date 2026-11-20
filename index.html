@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Blooming Flower Garden</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      background: #040409;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Helvetica, Arial, sans-serif;
+      touch-action: manipulation;
+    }
+    canvas {
+      display: block;
+      max-width: 100vw;
+      max-height: 100vh;
+      box-shadow: 0 0 60px rgba(70, 8, 22, 0.45);
+    }
+    .hint {
+      position: fixed;
+      bottom: 12px;
+      right: 16px;
+      color: rgba(255, 205, 210, 0.35);
+      font-size: 12px;
+      pointer-events: none;
+      letter-spacing: 0.4px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="garden"></canvas>
+  <div class="hint">Tap or press R to replay</div>
+
+  <script>
+    // ------------------------------------------------------------------------
+    // SETTINGS - customise your messages here
+    // ------------------------------------------------------------------------
+    const W = 1100;
+    const H = 720;
+
+    const MESSAGES = [
+      ["Hope You had a Great Day",     0.17, 0.22],
+      ["And may it get Better",          0.80, 0.27],
+      ["Flowers for You",     0.12, 0.62],
+      ["A Small Token", 0.82, 0.60],
+    ];
+
+    const GROUND_Y = Math.floor(H * 0.90);
+    const CENTER_X = Math.floor(W / 2);
+
+    const canvas = document.getElementById("garden");
+    const ctx = canvas.getContext("2d");
+    canvas.width = W;
+    canvas.height = H;
+
+    // Offscreen 1/8th glow buffer (matches Pygame smoothscale + BLEND_RGB_ADD)
+    const GW = Math.floor(W / 8);
+    const GH = Math.floor(H / 8);
+    const glowCanvas = document.createElement("canvas");
+    glowCanvas.width = GW;
+    glowCanvas.height = GH;
+    const gctx = glowCanvas.getContext("2d");
+
+    // Pre-render radial background
+    const bgCanvas = document.createElement("canvas");
+    bgCanvas.width = W;
+    bgCanvas.height = H;
+    const bgCtx = bgCanvas.getContext("2d");
+    (function makeBackground() {
+      bgCtx.fillStyle = "rgb(4, 4, 9)";
+      bgCtx.fillRect(0, 0, W, H);
+      const cx = W / 2;
+      const cy = H * 0.55;
+      const maxR = W * 0.6;
+      const grad = bgCtx.createRadialGradient(cx, cy, 0, cx, cy, maxR);
+      grad.addColorStop(0, "rgb(70, 8, 22)");
+      grad.addColorStop(0.55, "rgb(26, 5, 13)");
+      grad.addColorStop(1, "rgb(4, 4, 9)");
+      bgCtx.fillStyle = grad;
+      bgCtx.fillRect(0, 0, W, H);
+    })();
+
+    // ---------- helpers -----------------------------------------------------
+    const clamp01 = (v) => Math.max(0, Math.min(1, v));
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+    function easeOutBack(t) {
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+    }
+    const wind = (t, x) =>
+      0.6 * Math.sin(t * 0.9 + x * 0.004) + 0.4 * Math.sin(t * 1.7 + x * 0.011);
+
+    function mix(c1, c2, k) {
+      return [
+        Math.round(c1[0] + (c2[0] - c1[0]) * k),
+        Math.round(c1[1] + (c2[1] - c1[1]) * k),
+        Math.round(c1[2] + (c2[2] - c1[2]) * k),
+      ];
+    }
+    const rgb = (c) => `rgb(${c[0]},${c[1]},${c[2]})`;
+    const rgba = (c, a) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+
+    function randUniform(a, b) {
+      return a + Math.random() * (b - a);
+    }
+    function randGauss(mean, std) {
+      let u = 0, v = 0;
+      while (u === 0) u = Math.random();
+      while (v === 0) v = Math.random();
+      return mean + std * Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+    }
+
+    function drawPoly(context, left, right, fillStyle, strokeStyle = null, lineWidth = 1) {
+      if (left.length + right.length < 3) return;
+      context.beginPath();
+      context.moveTo(left[0][0], left[0][1]);
+      for (let i = 1; i < left.length; i++) context.lineTo(left[i][0], left[i][1]);
+      for (let i = right.length - 1; i >= 0; i--) context.lineTo(right[i][0], right[i][1]);
+      context.closePath();
+      if (fillStyle) {
+        context.fillStyle = fillStyle;
+        context.fill();
+      }
+      if (strokeStyle) {
+        context.strokeStyle = strokeStyle;
+        context.lineWidth = lineWidth;
+        context.stroke();
+      }
+    }
+
+    // ---------- grass -------------------------------------------------------
+    class Blade {
+      constructor() {
+        this.x = Math.max(30, Math.min(W - 30, randGauss(CENTER_X, W * 0.2)));
+        this.h = randUniform(70, 230);
+        this.w = randUniform(4, 9);
+        this.lean = randUniform(-0.35, 0.35);
+        this.bend = randUniform(-0.5, 0.5);
+        this.phase = randUniform(0, Math.PI * 2);
+        this.delay = randUniform(0.0, 3.0);
+        this.color = rgb(mix([25, 120, 70], [90, 230, 110], Math.random()));
+      }
+      draw(t) {
+        const g = easeOutCubic(clamp01((t - this.delay) / 3.5));
+        if (g <= 0) return;
+        const length = this.h * g;
+        const w = wind(t, this.x);
+        const n = 9;
+        let x = this.x, y = GROUND_Y;
+        const left = [], right = [];
+        for (let i = 0; i <= n; i++) {
+          const u = i / n;
+          const ang = this.lean + this.bend * u * u + (w * 0.35 + 0.06 * Math.sin(t * 2 + this.phase)) * u;
+          const hw = this.w * 0.5 * Math.pow(1 - u, 0.9);
+          const px = Math.cos(ang), py = Math.sin(ang);
+          left.push([x - px * hw, y - py * hw]);
+          right.push([x + px * hw, y + py * hw]);
+          x += Math.sin(ang) * (length / n);
+          y -= Math.cos(ang) * (length / n);
+        }
+        drawPoly(ctx, left, right, this.color);
+      }
+    }
+
+    // ---------- teal leaves -------------------------------------------------
+    class Leaf {
+      constructor() {
+        this.x = CENTER_X + randUniform(-45, 45);
+        this.angle = randUniform(-1.35, 1.35);
+        this.length = randUniform(90, 190) * (1.15 - Math.abs(this.angle) * 0.2);
+        this.width = randUniform(16, 30);
+        this.bend = randUniform(-0.5, 0.5);
+        this.delay = randUniform(0.2, 2.5);
+        this.phase = randUniform(0, Math.PI * 2);
+        const k = Math.random();
+        this.fill = rgb(mix([12, 85, 105], [30, 170, 170], k));
+        this.edge = rgb(mix([70, 200, 200], [150, 255, 235], k));
+      }
+      draw(t) {
+        const g = easeOutCubic(clamp01((t - this.delay) / 4.0));
+        if (g <= 0) return;
+        const L = this.length * g;
+        const w = wind(t, this.x);
+        const n = 10;
+        let x = this.x, y = GROUND_Y;
+        const left = [], right = [], spine = [];
+        for (let i = 0; i <= n; i++) {
+          const u = i / n;
+          const ang = this.angle + this.bend * u + (w * 0.3 + 0.05 * Math.sin(t * 2.2 + this.phase)) * u;
+          const hw = this.width * g * Math.sin(Math.PI * Math.min(1, Math.pow(u, 0.8))) * 0.5;
+          const px = Math.cos(ang), py = Math.sin(ang);
+          left.push([x - px * hw, y - py * hw]);
+          right.push([x + px * hw, y + py * hw]);
+          spine.push([x, y]);
+          x += Math.sin(ang) * (L / n);
+          y -= Math.cos(ang) * (L / n);
+        }
+        drawPoly(ctx, left, right, this.fill, this.edge, 1);
+        ctx.beginPath();
+        ctx.moveTo(spine[0][0], spine[0][1]);
+        for (let i = 1; i < spine.length; i++) ctx.lineTo(spine[i][0], spine[i][1]);
+        ctx.strokeStyle = this.edge;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    // ---------- flowers -----------------------------------------------------
+    class Flower {
+      constructor(x, height, size, delay, lean, outer, inner) {
+        this.x = x;
+        this.height = height;
+        this.size = size;
+        this.delay = delay;
+        this.lean = lean;
+        this.outer = outer;
+        this.inner = inner;
+        this.head = [x, GROUND_Y];
+        this.bloom = 0;
+        this.tilt = 0;
+        this.stemP = 0;
+      }
+      update(t) {
+        const g = clamp01((t - this.delay) / 7.0);
+        this.stemP = easeOutCubic(clamp01(g / 0.65));
+        this.bloom = Math.max(0, easeOutBack(clamp01((g - 0.55) / 0.45)));
+        const w = wind(t, this.x);
+        const s = this.stemP;
+        this.p0 = [this.x, GROUND_Y];
+        this.tip = [this.x + this.lean * s + w * 38 * s, GROUND_Y - this.height * s];
+        this.ctrl = [this.x + this.lean * 0.2 * s + w * 8 * s, GROUND_Y - this.height * 0.55 * s];
+        this.head = this.tip;
+        const dx = this.tip[0] - this.ctrl[0];
+        const dy = this.tip[1] - this.ctrl[1];
+        this.tilt = (dx || dy) ? Math.atan2(dx, -dy) : 0;
+      }
+      stemPoints(n = 22) {
+        const pts = [];
+        for (let i = 0; i <= n; i++) {
+          const u = i / n;
+          const x = (1 - u) ** 2 * this.p0[0] + 2 * (1 - u) * u * this.ctrl[0] + u * u * this.tip[0];
+          const y = (1 - u) ** 2 * this.p0[1] + 2 * (1 - u) * u * this.ctrl[1] + u * u * this.tip[1];
+          pts.push([x, y]);
+        }
+        return pts;
+      }
+      petal(base, ang, length, width, color, edge = null) {
+        const dx = Math.sin(ang), dy = -Math.cos(ang);
+        const px = Math.cos(ang), py = Math.sin(ang);
+        const n = 9;
+        const left = [], right = [];
+        for (let i = 0; i <= n; i++) {
+          const u = i / n;
+          const hw = width * 0.5 * Math.sin(Math.PI * Math.min(1, Math.pow(u, 0.7)));
+          const cx = base[0] + dx * u * length;
+          const cy = base[1] + dy * u * length;
+          left.push([cx - px * hw, cy - py * hw]);
+          right.push([cx + px * hw, cy + py * hw]);
+        }
+        drawPoly(ctx, left, right, rgb(color), edge ? rgb(edge) : null, 1);
+      }
+      draw() {
+        if (this.stemP <= 0.001) return;
+        const pts = this.stemPoints();
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.strokeStyle = "rgb(25, 140, 95)";
+        ctx.lineWidth = 5;
+        ctx.stroke();
+
+        ctx.strokeStyle = "rgb(80, 225, 150)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        if (this.stemP > 0.4) {
+          const mid = pts[Math.floor(pts.length / 2)];
+          for (const side of [-1, 1]) {
+            const a = side * 0.9 + this.tilt * 0.3;
+            this.petal(mid, a, 38 * this.stemP, 14, [30, 165, 120], [110, 240, 180]);
+          }
+        }
+
+        const b = this.bloom;
+        if (b <= 0.01) {
+          ctx.beginPath();
+          ctx.arc(this.head[0], this.head[1], 5, 0, Math.PI * 2);
+          ctx.fillStyle = rgb(this.outer);
+          ctx.fill();
+          return;
+        }
+
+        const n = 6;
+        const spread = (68 * Math.PI) / 180;
+        const order = [...Array(n).keys()].sort(
+          (a, c) => -Math.abs((a / (n - 1)) * 2 - 1) - -Math.abs((c / (n - 1)) * 2 - 1)
+        );
+        for (const i of order) {
+          const f = (i / (n - 1)) * 2 - 1;
+          const ang = this.tilt + f * spread * b;
+          const length = this.size * (0.35 + 0.65 * b) * (1 - 0.18 * Math.abs(f));
+          const width = this.size * 0.55 * (0.45 + 0.55 * b);
+          this.petal(this.head, ang, length, width, this.outer, [255, 150, 120]);
+          this.petal(this.head, ang, length * 0.78, width * 0.55, this.inner);
+        }
+
+        const r = Math.max(2, this.size * 0.11 * b);
+        ctx.beginPath();
+        ctx.arc(this.head[0], this.head[1], r, 0, Math.PI * 2);
+        ctx.fillStyle = "rgb(255, 215, 130)";
+        ctx.fill();
+      }
+      glow() {
+        if (this.bloom <= 0.01) return;
+        const cx = this.head[0] / 8;
+        const cy = this.head[1] / 8;
+        const R = (this.size * 1.6 * this.bloom) / 8;
+        for (let k = 7; k >= 1; k--) {
+          const r = (R * k) / 7;
+          const c = Math.floor(((60 * (8 - k)) / 7) * Math.min(1, this.bloom));
+          gctx.beginPath();
+          gctx.arc(cx, cy, Math.max(1, r), 0, Math.PI * 2);
+          gctx.fillStyle = `rgb(${c},${Math.floor(c / 4)},${Math.floor(c / 5)})`;
+          gctx.fill();
+        }
+      }
+    }
+
+    // ---------- text pills --------------------------------------------------
+    function roundRectPath(context, x, y, w, h, r) {
+      const radius = Math.min(r, w / 2, h / 2);
+      context.beginPath();
+      context.moveTo(x + radius, y);
+      context.arcTo(x + w, y, x + w, y + h, radius);
+      context.arcTo(x + w, y + h, x, y + h, radius);
+      context.arcTo(x, y + h, x, y, radius);
+      context.arcTo(x, y, x + w, y, radius);
+      context.closePath();
+    }
+
+    class Pill {
+      constructor(text, fx, fy, delay) {
+        this.text = text;
+        this.x = fx * W;
+        this.y = fy * H;
+        this.delay = delay;
+        this.phase = randUniform(0, Math.PI * 2);
+      }
+      draw(t) {
+        const a = clamp01((t - this.delay) / 1.5);
+        if (a <= 0) return;
+
+        ctx.save();
+        ctx.globalAlpha = a;
+        ctx.font = 'bold 20px "Segoe UI", Helvetica, Arial, sans-serif';
+        const metrics = ctx.measureText(this.text);
+        const padX = 20, padY = 11;
+        const w = metrics.width + padX * 2;
+        const h = 24 + padY * 2;
+        const bob = Math.sin(t * 1.2 + this.phase) * 6;
+        const cx = this.x;
+        const cy = this.y + bob + (1 - a) * 15;
+        const rx = cx - w / 2;
+        const ry = cy - h / 2;
+
+        roundRectPath(ctx, rx - 7, ry - 7, w + 14, h + 14, h);
+        ctx.fillStyle = "rgba(255, 40, 60, 0.16)";
+        ctx.fill();
+
+        roundRectPath(ctx, rx - 3.5, ry - 3.5, w + 7, h + 7, h);
+        ctx.fillStyle = "rgba(255, 50, 70, 0.35)";
+        ctx.fill();
+
+        roundRectPath(ctx, rx, ry, w, h, h);
+        ctx.fillStyle = "rgba(50, 0, 10, 0.75)";
+        ctx.fill();
+        ctx.strokeStyle = "rgb(255, 75, 85)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.fillStyle = "rgb(255, 205, 210)";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(this.text, cx, cy + 1);
+        ctx.restore();
+      }
+    }
+
+    // ---------- fireflies ---------------------------------------------------
+    class Firefly {
+      constructor() {
+        this.reset();
+      }
+      reset() {
+        this.x = randUniform(0, W);
+        this.y = randUniform(H * 0.2, H);
+        this.vx = randUniform(-6, 6);
+        this.vy = randUniform(-14, -4);
+        this.phase = randUniform(0, Math.PI * 2);
+        this.r = randUniform(1.5, 3.2);
+      }
+      update(dt) {
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        if (this.y < -10) {
+          this.reset();
+          this.y = H + 5;
+        }
+      }
+      draw(t) {
+        const k = 0.5 + 0.5 * Math.sin(t * 2 + this.phase);
+        const c = Math.floor(120 + 135 * k);
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgb(255, ${c}, 140)`;
+        ctx.fill();
+
+        gctx.beginPath();
+        gctx.arc(this.x / 8, this.y / 8, 2, 0, Math.PI * 2);
+        gctx.fillStyle = `rgb(${Math.floor(60 * k)}, ${Math.floor(25 * k)}, ${Math.floor(20 * k)})`;
+        gctx.fill();
+      }
+    }
+
+    // ---------- scene management --------------------------------------------
+    let grass, leaves, flowers, pills, flies, startTime, lastFrame;
+
+    function buildScene() {
+      grass = Array.from({ length: 70 }, () => new Blade()).sort((a, b) => a.h - b.h);
+      leaves = Array.from({ length: 18 }, () => new Leaf());
+      flowers = [
+        new Flower(CENTER_X - 28, 300, 78, 1.0, -30, [225, 55, 45], [255, 140, 80]),
+        new Flower(CENTER_X + 6,  360, 88, 2.2,   5, [235, 70, 40], [255, 160, 90]),
+        new Flower(CENTER_X + 50, 280, 74, 3.4,  40, [220, 50, 55], [255, 130, 85]),
+      ];
+      pills = MESSAGES.map(([text, fx, fy], i) => new Pill(text, fx, fy, 5.0 + i * 1.8));
+      flies = Array.from({ length: 35 }, () => new Firefly());
+      startTime = performance.now();
+      lastFrame = startTime;
+    }
+
+    function loop(now) {
+      const dt = Math.min(0.05, (now - lastFrame) / 1000);
+      lastFrame = now;
+      const t = (now - startTime) / 1000;
+
+      ctx.drawImage(bgCanvas, 0, 0);
+
+      gctx.fillStyle = "#000";
+      gctx.fillRect(0, 0, GW, GH);
+
+      for (const f of flowers) {
+        f.update(t);
+        f.glow();
+      }
+
+      const baseC = Math.floor(40 * clamp01(t / 4));
+      gctx.beginPath();
+      gctx.arc(CENTER_X / 8, GROUND_Y / 8, 14, 0, Math.PI * 2);
+      gctx.fillStyle = `rgb(0, ${baseC}, ${baseC})`;
+      gctx.fill();
+
+      for (const fl of flies) fl.update(dt);
+
+      for (const b of grass) b.draw(t);
+      for (const lf of leaves) lf.draw(t);
+      for (const f of flowers) f.draw();
+      for (const fl of flies) fl.draw(t);
+
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.imageSmoothingEnabled = true;
+      ctx.drawImage(glowCanvas, 0, 0, W, H);
+      ctx.restore();
+
+      for (const p of pills) p.draw(t);
+
+      requestAnimationFrame(loop);
+    }
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "r" || e.key === "R") buildScene();
+    });
+    canvas.addEventListener("click", () => buildScene());
+
+    buildScene();
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
